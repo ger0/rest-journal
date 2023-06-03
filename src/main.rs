@@ -1,11 +1,12 @@
 use actix_web::{get, post, App, web, HttpResponse, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 // journal entry
 #[derive(Debug, Serialize, Deserialize)]
 #[derive(Clone)]
-struct Entry {
+
+struct Journal {
     title: String,
     data: String,
 }
@@ -18,8 +19,8 @@ struct Task {
 }
 
 struct State {
-    journals: Vec<Entry>,
-    tasks: Vec<Task>
+    journals: RwLock<Vec<Journal>>,
+    // tasks: Vec<Task>
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,32 +32,30 @@ struct PaginationParams {
 #[derive(Debug, Serialize)]
 struct PaginationResponse {
     page: usize,
-    per_page: usize,
     total_entries: usize,
     total_pages: usize,
-    journals: Vec<Entry>,
+    journals: Vec<Journal>,
 }
 
 #[get("/journals")]
 async fn get_journals(
     query: web::Query<PaginationParams>,
-    app_state: web::Data<Mutex<State>>,
+    app_state: web::Data<State>,
 ) -> impl Responder {
     let page_num = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(5);
 
-    let state = app_state.lock().unwrap();
+    let journals = app_state.journals.read().unwrap();
 
-    let total_entries = state.journals.len();
+    let total_entries = journals.len();
     let total_pages = (total_entries + per_page - 1) / per_page;
 
     let start_index = (page_num - 1) * per_page;
     let end_index = start_index + per_page;
-    let paginated_journals = &state.journals[start_index..end_index];
+    let paginated_journals = &journals[start_index..end_index];
 
     let response = PaginationResponse {
         page: page_num,
-        per_page,
         total_entries,
         total_pages,
         journals: paginated_journals.to_vec(),
@@ -68,13 +67,13 @@ async fn get_journals(
 #[get("/journals/{id}")]
 async fn get_journals_by_id(
     path: web::Path<usize>,
-    app_state: web::Data<Mutex<State>>,
+    app_state: web::Data<State>,
 ) -> impl Responder {
 
     println!("HELLO!");
     let journal_id = path.into_inner();
     println!("Path: {}", journal_id);
-    if let Some(journal) = app_state.lock().unwrap().journals.get(journal_id) {
+    if let Some(journal) = app_state.journals.read().unwrap().get(journal_id) {
         HttpResponse::Ok().json(journal)
     } else {
         HttpResponse::NotFound().body("Journal not found")
@@ -84,19 +83,19 @@ async fn get_journals_by_id(
 #[post("/journals")]
 async fn add_journal(
     req_body: String, 
-    app_state: web::Data<Mutex<State>>
+    app_state: web::Data<State>
 ) -> impl Responder {
 
-    let mut journal = app_state.lock().unwrap();
+    let mut journals = app_state.journals.write().unwrap();
 
-    let index = journal.journals.len();
+    let index = journals.len();
     let uri = format!("/journals/{}", index);
 
-    journal.journals.push(Entry{
-        title: String::from("Entry"),
+    journals.push(Journal{
+        title: String::from("Journal"),
         data: String::from(req_body)
     });
-    println!("{}, at index: {}", journal.journals[index].data, index);
+    println!("{}, at index: {}", journals[index].data, index);
     HttpResponse::Created()
         .append_header(("Location", uri)).body(String::from("OK"))
 }
@@ -106,17 +105,16 @@ async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
     let tasks: Vec<Task> = Vec::new();
-    let mut journals: Vec<Entry> = Vec::new();
+    let mut journals: Vec<Journal> = Vec::new();
     for i in 0..10 {
-        journals.push(Entry{
+        journals.push(Journal{
             title: format!("Title {}", i),
             data: String::from("Hello World!")
         });
     }
-    let app_state = web::Data::new(Mutex::new(State {
-        journals,
-        tasks
-    }));
+    let app_state = web::Data::new(State {
+        journals: RwLock::new(journals)
+    });
 
     HttpServer::new(move || {
         App::new()
