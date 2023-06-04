@@ -1,4 +1,3 @@
-use actix_web::{get, post, delete, put, patch};
 use actix_web::{App, web, HttpResponse, HttpRequest, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
 use std::sync::{RwLock, Mutex};
@@ -31,16 +30,16 @@ struct State {
 }
 
 trait Readable<T> {
-    fn read_hmap(&self) -> &RwLock<HashMap<usize, T>>;
+    fn get_hmap(&self) -> &RwLock<HashMap<usize, T>>;
 }
 
 impl Readable<Journal> for State {
-    fn read_hmap(&self) -> &RwLock<HashMap<usize, Journal>> {
+    fn get_hmap(&self) -> &RwLock<HashMap<usize, Journal>> {
         return &self.journals;
     }
 }
 impl Readable<Task> for State {
-    fn read_hmap(&self) -> &RwLock<HashMap<usize, Task>> {
+    fn get_hmap(&self) -> &RwLock<HashMap<usize, Task>> {
         return &self.tasks;
     }
 }
@@ -82,8 +81,7 @@ struct PaginationResponse<T> {
     total_pages: usize,
     entries: Vec<T>,
 }
-// ------------------------------------ TOKENS ----------------------------------------
-#[post("/tokens")]
+
 async fn gen_token(state: web::Data<State>) -> impl Responder {
     let token = state.gen_token();
     println!("Generated token: {}", token);
@@ -91,7 +89,6 @@ async fn gen_token(state: web::Data<State>) -> impl Responder {
         .body(String::from(token))
 }
 
-// ------------------------------------ JOURNALS --------------------------------------
 async fn get_by_id<T: 'static>(
     path: web::Path<usize>,
     state: web::Data<State>,
@@ -115,7 +112,6 @@ async fn get_by_id<T: 'static>(
     return response;
 }
 
-#[post("/journals")]
 async fn add_journal(json: web::Json<Journal>, state: web::Data<State>, request: HttpRequest) -> impl Responder {
     let token_val = request.headers().get("Post-Token");
     if token_val == None {
@@ -142,8 +138,6 @@ async fn add_journal(json: web::Json<Journal>, state: web::Data<State>, request:
         .append_header(("Location", uri)).body(String::from("OK"))
 }
 
-// ------------------------------------ TASKS -----------------------------------------
-#[post("/tasks")]
 async fn add_task(json: web::Json<Task>, state: web::Data<State>, request: HttpRequest) -> impl Responder {
     let token_val = request.headers().get("Post-Token");
     if token_val == None {
@@ -170,17 +164,18 @@ async fn add_task(json: web::Json<Task>, state: web::Data<State>, request: HttpR
         .append_header(("Location", uri)).body(String::from("OK"))
 }
 
-#[delete("/tasks/{id}")]
-async fn delete_task(
+async fn delete_resource<T>(
     path: web::Path<usize>,
     app_state: web::Data<State>,
-) -> impl Responder {
-
+) -> impl Responder where State: Readable<T>, T: Serialize {
+    let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
+    let mut resources = hmap.write().unwrap();
     let id = path.into_inner();
-    if let Some(task) = app_state.tasks.read().unwrap().get(&id) {
-        HttpResponse::Ok().json(task)
+    if let Some(_) = resources.get(&id) {
+        resources.remove(&id);
+        HttpResponse::Ok().json("Removed")
     } else {
-        HttpResponse::NotFound().body("Journal not found")
+        HttpResponse::NotFound().body("Not found")
     }
 }
 
@@ -189,7 +184,7 @@ async fn get_resources<T>(
     app_state: web::Data<State>,
 ) -> impl Responder where State: Readable<T>, T: Serialize {
     // I'll end up in hell for this...
-    let hmap: &RwLock<HashMap<usize, T>> = app_state.read_hmap();
+    let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
     let resources = hmap.read().unwrap();
 
     let page_num = query.page.unwrap_or(1);
@@ -216,7 +211,6 @@ async fn get_resources<T>(
     
     HttpResponse::Ok().json(response)
 }
-// ------------------------------------ MAIN  -----------------------------------------
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -243,24 +237,29 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .service(gen_token)
-            .service(add_journal)
-            .service(add_task)
+            .service(
+                web::resource("/tokens")
+                .route(web::post().to(gen_token))
+            )
             .service(
                 web::resource("/tasks")
                 .route(web::get().to(get_resources::<Task>))
+                .route(web::post().to(add_task))
             )
             .service(
                 web::resource("/tasks/{id}")
                 .route(web::get().to(get_by_id::<Task>))
-            )
-            .service(
-                web::resource("/journals/{id}")
-                .route(web::get().to(get_by_id::<Journal>))
+                .route(web::delete().to(delete_resource::<Task>))
             )
             .service(
                 web::resource("/journals")
                 .route(web::get().to(get_resources::<Journal>))
+                .route(web::post().to(add_journal))
+            )
+            .service(
+                web::resource("/journals/{id}")
+                .route(web::get().to(get_by_id::<Journal>))
+                .route(web::delete().to(delete_resource::<Journal>))
             )
     })
     .bind(("127.0.0.1", 8080))?
