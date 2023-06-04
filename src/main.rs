@@ -6,22 +6,118 @@ use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use std::any::TypeId;
 
-// journal entry
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct Journal {
-    title: String,
-    data: String,
+#[derive(Debug, Clone)]
+struct Metadata {
+    etag:   String,
+    id:     usize
 }
 
-// Todo entry
-#[derive(Debug, Serialize, Deserialize, Clone)]
+// journal entry
+#[derive(Debug, Clone)]
+struct Journal {
+    metainf:    Metadata,
+    title:      String,
+    data:       String,
+}
+
+impl Serialize for Journal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+        #[derive(Serialize, Deserialize)]
+        struct Temp {
+            id:     usize,
+            title:  String,
+            data:   String,
+        }
+        let temp = Temp {
+            id:     self.metainf.id,
+            title:  self.title.clone(),
+            data:   self.data.clone()
+        };
+        temp.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Journal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de> {
+        let json_obj = serde_json::Value::deserialize(deserializer)?;
+
+        let id_test = json_obj["id"].as_u64();
+        let id = id_test.unwrap();
+
+        let title = json_obj["title"]
+            .as_str()
+            .unwrap();
+
+        let data = json_obj["data"]
+            .as_str()
+            .unwrap();
+
+        Ok(Journal {
+            metainf: Metadata {
+                id: id as usize,
+                etag: String::from("Test"),
+            },
+            title:  String::from(title),
+            data:   String::from(data)
+        })
+    }
+}
+
+// task entry
+#[derive(Debug, Clone)]
 struct Task {
-    text: String,
-    done: bool
+    metainf:    Metadata,
+    text:       String,
+    done:       bool,
+}
+
+impl Serialize for Task {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+        #[derive(Serialize, Deserialize)]
+        struct Temp {
+            id:     usize,
+            text:   String,
+            done:   bool,
+        }
+        let temp = Temp {
+            id:     self.metainf.id,
+            text:   self.text.clone(),
+            done:   self.done,
+        };
+        temp.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de> {
+        let json_obj = serde_json::Value::deserialize(deserializer)?;
+        let id = json_obj["id"].as_u64().unwrap();
+        let text = json_obj["text"]
+            .as_str()
+            .unwrap();
+        let done = json_obj["done"]
+            .as_bool()
+            .unwrap();
+        Ok(Task {
+            metainf: Metadata {
+                id: id as usize,
+                etag: String::from("Test"),
+            },
+            text: String::from(text),
+            done
+        })
+    }
 }
 const TOKEN_LENGTH: usize = 16;
 
-#[derive(Serialize, Deserialize)]
 // Application state
 struct State {
     journals:   RwLock<HashMap<usize, Journal>>,
@@ -220,10 +316,18 @@ async fn main() -> std::io::Result<()> {
     let mut journals: HashMap<usize, Journal> = HashMap::new();
     for i in 0..10 {
         journals.insert(i, Journal{
+            metainf: Metadata{
+                id: i,
+                etag: String::from("1")
+            },
             title: format!("Title {}", i),
             data: String::from("Hello World!")
         });
         tasks.insert(i, Task{
+            metainf: Metadata{
+                id: i,
+                etag: String::from("1")
+            },
             text: format!("Do the {}", i),
             done: false
         });
