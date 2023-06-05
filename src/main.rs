@@ -6,7 +6,7 @@ use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use sha256::digest;
 
-const TOKEN_LENGTH: usize = 16;
+const TOKEN_LENGTH: usize = 32;
 
 // journal entry
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -135,56 +135,43 @@ async fn get_by_id<T: Serialize + Etagged>(
     }
 }
 
-async fn add_journal(json: web::Json<Journal>, state: web::Data<State>, request: HttpRequest) -> impl Responder {
-    let token_val = request.headers().get("Post-Token");
-    if token_val == None {
-        return HttpResponse::BadRequest()
-            .body(String::from("Missing token"))
-    }
-    let token = token_val.unwrap().to_str().unwrap();
+async fn post_resource<T: Etagged + Serialize>(
+    json: web::Json<T>, 
+    state: web::Data<State>, 
+    request: HttpRequest
+) -> impl Responder where State: Readable<T> {
+
+    let bad_request = |reason| HttpResponse::BadRequest().body(String::from(reason));
+    let token_val = match request.headers().get("Post-Token") {
+        Some(token) => token,
+        None        => return bad_request("Missing token"),
+    };
+    let token = match token_val.to_str() {
+        Ok(str) => str,
+        Err(_)  => return bad_request("Error during token retrieval"),
+    };
+
     let is_allowed = state.consume_token(token);
 
     if !is_allowed {
-        return HttpResponse::BadRequest()
-            .body(String::from("Bad token"))
-
+        return bad_request("Bad token");
     }
-    let mut journals = state.journals.write().unwrap();
-    let index = journals.len();
+
+    let mut resources = state.get_hmap().write().unwrap();
+    let index = resources.len();
 
     let uri = format!("{}/{}", request.uri().path(), index);
 
-    let mut journal = json.into_inner();
-    journal.etag = String::from(token);
-    journals.insert(index, journal);
-    println!("{}, added at index: {}", journals[&index].data, index);
-    return HttpResponse::Created()
-        .append_header(("Location", uri)).body(String::from("OK"))
-}
+    let serialized_json = match serde_json::to_string(&json.0) {
+        Ok(srlz)    => srlz,
+        Err(_)      => return bad_request("json error"),
+    };
 
-async fn add_task(json: web::Json<Task>, state: web::Data<State>, request: HttpRequest) -> impl Responder {
-    let token_val = request.headers().get("Post-Token");
-    if token_val == None {
-        return HttpResponse::BadRequest()
-            .body(String::from("Missing token"))
-    }
-    let token = token_val.unwrap().to_str().unwrap();
-    let is_allowed = state.consume_token(token);
-
-    if !is_allowed {
-        return HttpResponse::BadRequest()
-            .body(String::from("Bad token"))
-
-    }
-    let mut tasks = state.tasks.write().unwrap();
-    let index = tasks.len();
-
-    let uri = format!("{}/{}", request.uri().path(), index);
-
-    let mut task = json.into_inner();
-    task.etag = String::from(token);
-    tasks.insert(index, task);
-    println!("{}, done? {}, added at index: {}", tasks[&index].text, tasks[&index].done, index);
+    let mut resource = json.into_inner();
+    let etag = calculate_hash(serialized_json);
+    resource.set_etag(etag.clone());
+    resources.insert(index, resource);
+    println!("Resource created {}, added at index: {}", request.path(), index);
     return HttpResponse::Created()
         .append_header(("Location", uri)).body(String::from("OK"))
 }
@@ -219,19 +206,28 @@ async fn put_resource<T>(
 
     let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
     let mut resources = hmap.write().unwrap();
-    let if_match = request.headers().get("If-Match");
-    if if_match == None {
-        return HttpResponse::PreconditionFailed().body("ETag is missing!");
-    }
-    let etag = if_match.unwrap().to_str().unwrap();
+    let precond_fail = |reason| HttpResponse::PreconditionFailed().body(String::from(reason));
+    let etag = match request.headers().get("If-Match") {
+        Some(etag)  => etag,
+        None        => return precond_fail("ETag is missing!"),
+    };
+    let etag = match etag.to_str() {
+        Ok(etag)    => etag,
+        Err(_)      => return precond_fail("Illegal header!"),
+    };
+
     if let Some(replaced) = resources.get(&id) {
         if replaced.get_etag() != etag {
-            return HttpResponse::PreconditionFailed().body("ETag does not match!");
+            return precond_fail("ETag does not match!");
         }
     }
 
     // else put the element in the HashMap of the resource
-    let serialized_json = serde_json::to_string(&json.0).unwrap();
+    let serialized_json = match serde_json::to_string(&json.0) {
+        Ok(srlz)    => srlz,
+        Err(_)      => return HttpResponse::BadRequest().body("json error"),
+    };
+
     let mut new_resource = json.into_inner();
     let new_etag = calculate_hash(serialized_json);
     new_resource.set_etag(new_etag.clone());
@@ -309,7 +305,7 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/tasks")
                 .route(web::get().to(get_resources::<Task>))
-                .route(web::post().to(add_task))
+                .route(web::post().to(post_resource::<Task>))
             )
             .service(
                 web::resource("/tasks/{id}")
@@ -320,7 +316,7 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::resource("/journals")
                 .route(web::get().to(get_resources::<Journal>))
-                .route(web::post().to(add_journal))
+                .route(web::post().to(post_resource::<Journal>))
             )
             .service(
                 web::resource("/journals/{id}")
