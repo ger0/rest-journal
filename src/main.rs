@@ -4,119 +4,50 @@ use std::sync::{RwLock, Mutex};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::collections::HashMap;
-use std::any::TypeId;
+use sha256::digest;
 
-#[derive(Debug, Clone)]
-struct Metadata {
-    etag:   String,
-    id:     usize
-}
+const TOKEN_LENGTH: usize = 16;
 
 // journal entry
-#[derive(Debug, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Journal {
-    metainf:    Metadata,
     title:      String,
     data:       String,
-}
-
-impl Serialize for Journal {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer {
-        #[derive(Serialize, Deserialize)]
-        struct Temp {
-            id:     usize,
-            title:  String,
-            data:   String,
-        }
-        let temp = Temp {
-            id:     self.metainf.id,
-            title:  self.title.clone(),
-            data:   self.data.clone()
-        };
-        temp.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for Journal {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de> {
-        let json_obj = serde_json::Value::deserialize(deserializer)?;
-
-        let id_test = json_obj["id"].as_u64();
-        let id = id_test.unwrap();
-
-        let title = json_obj["title"]
-            .as_str()
-            .unwrap();
-
-        let data = json_obj["data"]
-            .as_str()
-            .unwrap();
-
-        Ok(Journal {
-            metainf: Metadata {
-                id: id as usize,
-                etag: String::from("Test"),
-            },
-            title:  String::from(title),
-            data:   String::from(data)
-        })
-    }
+    #[serde(skip_serializing, default)]
+    etag:       String
 }
 
 // task entry
-#[derive(Debug, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Task {
-    metainf:    Metadata,
     text:       String,
     done:       bool,
+    #[serde(skip_serializing, default)]
+    etag:       String
 }
 
-impl Serialize for Task {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer {
-        #[derive(Serialize, Deserialize)]
-        struct Temp {
-            id:     usize,
-            text:   String,
-            done:   bool,
-        }
-        let temp = Temp {
-            id:     self.metainf.id,
-            text:   self.text.clone(),
-            done:   self.done,
-        };
-        temp.serialize(serializer)
+trait Etagged {
+    fn get_etag(&self) -> String;
+    fn set_etag(&mut self, etag: String);
+}
+
+impl Etagged for Journal {
+    fn get_etag(&self) -> String {
+        return self.etag.clone();
+    }
+    fn set_etag(&mut self, etag: String) {
+        self.etag = etag;
     }
 }
 
-impl<'de> Deserialize<'de> for Task {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de> {
-        let json_obj = serde_json::Value::deserialize(deserializer)?;
-        let id = json_obj["id"].as_u64().unwrap();
-        let text = json_obj["text"]
-            .as_str()
-            .unwrap();
-        let done = json_obj["done"]
-            .as_bool()
-            .unwrap();
-        Ok(Task {
-            metainf: Metadata {
-                id: id as usize,
-                etag: String::from("Test"),
-            },
-            text: String::from(text),
-            done
-        })
+impl Etagged for Task {
+    fn get_etag(&self) -> String {
+        return self.etag.clone();
+    }
+    fn set_etag(&mut self, etag: String) {
+        self.etag = etag;
     }
 }
-const TOKEN_LENGTH: usize = 16;
 
 // Application state
 struct State {
@@ -185,27 +116,23 @@ async fn gen_token(state: web::Data<State>) -> impl Responder {
         .body(String::from(token))
 }
 
-async fn get_by_id<T: 'static>(
+async fn get_by_id<T: Serialize + Etagged>(
     path: web::Path<usize>,
     state: web::Data<State>,
-) -> impl Responder
+) -> impl Responder where State: Readable<T>
 {
     let id = path.into_inner();
-    let mut response = HttpResponse::NotFound().body("Not found");
-    if TypeId::of::<T>() == TypeId::of::<Journal>() {
-        response = HttpResponse::Ok().json(
-            state.journals.
-                read().
-                unwrap()
-                .get(&id));
-    } else if TypeId::of::<T>() == TypeId::of::<Task>() {
-        response = HttpResponse::Ok().json(
-            state.tasks
-                .read()
-                .unwrap()
-                .get(&id));
+
+    let hmap: &RwLock<HashMap<usize, T>> = state.get_hmap();
+    let resources = hmap.read().unwrap();
+    if let Some(resource) = resources.get(&id) {
+        let etag = resource.get_etag();
+        return HttpResponse::Ok()
+            .append_header(("ETag", etag))
+            .json(resource);
+    } else {
+        return HttpResponse::NotFound().body("Not found");
     }
-    return response;
 }
 
 async fn add_journal(json: web::Json<Journal>, state: web::Data<State>, request: HttpRequest) -> impl Responder {
@@ -227,8 +154,9 @@ async fn add_journal(json: web::Json<Journal>, state: web::Data<State>, request:
 
     let uri = format!("{}/{}", request.uri().path(), index);
 
-    let data = json.into_inner();
-    journals.insert(index, data);
+    let mut journal = json.into_inner();
+    journal.etag = String::from(token);
+    journals.insert(index, journal);
     println!("{}, added at index: {}", journals[&index].data, index);
     return HttpResponse::Created()
         .append_header(("Location", uri)).body(String::from("OK"))
@@ -253,8 +181,9 @@ async fn add_task(json: web::Json<Task>, state: web::Data<State>, request: HttpR
 
     let uri = format!("{}/{}", request.uri().path(), index);
 
-    let data = json.into_inner();
-    tasks.insert(index, data);
+    let mut task = json.into_inner();
+    task.etag = String::from(token);
+    tasks.insert(index, task);
     println!("{}, done? {}, added at index: {}", tasks[&index].text, tasks[&index].done, index);
     return HttpResponse::Created()
         .append_header(("Location", uri)).body(String::from("OK"))
@@ -273,6 +202,44 @@ async fn delete_resource<T>(
     } else {
         HttpResponse::NotFound().body("Not found")
     }
+}
+
+fn calculate_hash(json_string: String) -> String {
+    let hash = digest(json_string);
+    hash 
+}
+
+async fn put_resource<T>(
+    json:       web::Json<T>,
+    app_state:  web::Data<State>,
+    path:       web::Path<usize>,
+    request:    HttpRequest
+) -> impl Responder where State: Readable<T>, T: Serialize + Etagged {
+    let id = path.into_inner();
+
+    let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
+    let mut resources = hmap.write().unwrap();
+    let if_match = request.headers().get("If-Match");
+    if if_match == None {
+        return HttpResponse::PreconditionFailed().body("ETag is missing!");
+    }
+    let etag = if_match.unwrap().to_str().unwrap();
+    if let Some(replaced) = resources.get(&id) {
+        if replaced.get_etag() != etag {
+            return HttpResponse::PreconditionFailed().body("ETag does not match!");
+        }
+    }
+
+    // else put the element in the HashMap of the resource
+    let serialized_json = serde_json::to_string(&json.0).unwrap();
+    let mut new_resource = json.into_inner();
+    let new_etag = calculate_hash(serialized_json);
+    new_resource.set_etag(new_etag.clone());
+    resources.insert(id, new_resource);
+
+    return HttpResponse::Ok()
+        .append_header(("ETag", new_etag))
+        .body("Updated");
 }
 
 async fn get_resources<T>(
@@ -316,20 +283,14 @@ async fn main() -> std::io::Result<()> {
     let mut journals: HashMap<usize, Journal> = HashMap::new();
     for i in 0..10 {
         journals.insert(i, Journal{
-            metainf: Metadata{
-                id: i,
-                etag: String::from("1")
-            },
             title: format!("Title {}", i),
-            data: String::from("Hello World!")
+            data: String::from("Hello World!"),
+            etag: String::from("1")
         });
         tasks.insert(i, Task{
-            metainf: Metadata{
-                id: i,
-                etag: String::from("1")
-            },
             text: format!("Do the {}", i),
-            done: false
+            done: false,
+            etag: String::from("1")
         });
     }
     let app_state = web::Data::new(State {
@@ -354,6 +315,7 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/tasks/{id}")
                 .route(web::get().to(get_by_id::<Task>))
                 .route(web::delete().to(delete_resource::<Task>))
+                .route(web::put().to(put_resource::<Task>))
             )
             .service(
                 web::resource("/journals")
@@ -364,6 +326,7 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/journals/{id}")
                 .route(web::get().to(get_by_id::<Journal>))
                 .route(web::delete().to(delete_resource::<Journal>))
+                .route(web::put().to(put_resource::<Journal>))
             )
     })
     .bind(("127.0.0.1", 8080))?
