@@ -1,10 +1,13 @@
+use actix_web::web::Bytes;
 use actix_web::{App, web, HttpResponse, HttpRequest, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::{RwLock, Mutex};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use sha256::digest;
+
 
 const TOKEN_LENGTH: usize = 32;
 
@@ -196,6 +199,78 @@ fn calculate_hash(json_string: String) -> String {
     hash 
 }
 
+fn check_etag<T: Etagged>(
+    resource: &T, 
+    request: &HttpRequest) -> Result<(), String> {
+    let err = |str| Err(String::from(str));
+    let etag = match request.headers().get("If-Match") {
+        Some(etag)  => etag,
+        None        => return err("ETag is missing!"),
+    };
+    let etag = match etag.to_str() {
+        Ok(etag)    => etag,
+        Err(_)      => return err("Illegal header!"),
+    };
+    if resource.get_etag() != etag {
+        return err("ETag does not match!");
+    }
+    return Ok(());
+}
+
+async fn patch_task(
+    payload:    Bytes,
+    app_state:  web::Data<State>,
+    path:       web::Path<usize>,
+    request:    HttpRequest,
+) -> impl Responder {
+    let bad_request = |reason| HttpResponse::BadRequest().body(String::from(reason));
+
+    let id = path.into_inner();
+    let mut tasks = app_state.tasks.write().unwrap();
+    let mut task = match tasks.get_mut(&id) {
+        Some(task)  => task,
+        None        => return bad_request("No such resource"),
+    };
+
+    if let Err(txt) = check_etag(task, &request) {
+        return HttpResponse::PreconditionFailed().body(txt);
+    }
+
+    let json: Value = match serde_json::from_slice(&payload) {
+        Ok(json)    => json,
+        Err(_)      => return bad_request("Broken json"),
+    };
+
+    let mut is_updated = false;
+    if let Some(done) = json.get("done") {
+        if let Some(done) = done.as_bool() {
+            task.done = done;
+            is_updated = true;
+        }
+    }
+
+    if let Some(text) = json.get("text") {
+        if let Some(text) = text.as_str() {
+            task.text = String::from(text);
+            is_updated = true;
+        }
+    }
+
+    if is_updated {
+        let serialized_json = match serde_json::to_string(&json) {
+            Ok(srlz)    => srlz,
+            Err(_)      => return HttpResponse::BadRequest().body("Json error"),
+        };
+        let new_etag = calculate_hash(serialized_json);
+        task.set_etag(new_etag.clone());
+        return HttpResponse::Ok()
+            .append_header(("ETag", new_etag))
+            .body("Updated");
+    } else {
+        return bad_request("Nothing to update");
+    }
+}
+
 async fn put_resource<T>(
     json:       web::Json<T>,
     app_state:  web::Data<State>,
@@ -206,19 +281,10 @@ async fn put_resource<T>(
 
     let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
     let mut resources = hmap.write().unwrap();
-    let precond_fail = |reason| HttpResponse::PreconditionFailed().body(String::from(reason));
-    let etag = match request.headers().get("If-Match") {
-        Some(etag)  => etag,
-        None        => return precond_fail("ETag is missing!"),
-    };
-    let etag = match etag.to_str() {
-        Ok(etag)    => etag,
-        Err(_)      => return precond_fail("Illegal header!"),
-    };
 
-    if let Some(replaced) = resources.get(&id) {
-        if replaced.get_etag() != etag {
-            return precond_fail("ETag does not match!");
+    if let Some(resource) = resources.get(&id) {
+        if let Err(txt) = check_etag(resource, &request) {
+            return HttpResponse::PreconditionFailed().body(txt);
         }
     }
 
@@ -312,6 +378,7 @@ async fn main() -> std::io::Result<()> {
                 .route(web::get().to(get_by_id::<Task>))
                 .route(web::delete().to(delete_resource::<Task>))
                 .route(web::put().to(put_resource::<Task>))
+                .route(web::patch().to(patch_task))
             )
             .service(
                 web::resource("/journals")
