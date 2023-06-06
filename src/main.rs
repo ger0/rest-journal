@@ -201,18 +201,17 @@ fn calculate_hash(json_string: String) -> String {
 
 fn check_etag<T: Etagged>(
     resource: &T, 
-    request: &HttpRequest) -> Result<(), String> {
-    let err = |str| Err(String::from(str));
+    request: &HttpRequest) -> Result<(), HttpResponse> {
     let etag = match request.headers().get("If-Match") {
         Some(etag)  => etag,
-        None        => return err("ETag is missing!"),
+        None        => return Err(HttpResponse::PreconditionRequired().body("ETag is missing!")),
     };
     let etag = match etag.to_str() {
         Ok(etag)    => etag,
-        Err(_)      => return err("Illegal header!"),
+        Err(_)      => return Err(HttpResponse::BadRequest().body("Broken header!")),
     };
     if resource.get_etag() != etag {
-        return err("ETag does not match!");
+        return Err(HttpResponse::PreconditionFailed().body("ETag does not match!"));
     }
     return Ok(());
 }
@@ -232,8 +231,8 @@ async fn patch_task(
         None        => return bad_request("No such resource"),
     };
 
-    if let Err(txt) = check_etag(task, &request) {
-        return HttpResponse::PreconditionFailed().body(txt);
+    if let Err(response) = check_etag(task, &request) {
+        return response;
     }
 
     let json: Value = match serde_json::from_slice(&payload) {
@@ -283,8 +282,8 @@ async fn put_resource<T>(
     let mut resources = hmap.write().unwrap();
 
     if let Some(resource) = resources.get(&id) {
-        if let Err(txt) = check_etag(resource, &request) {
-            return HttpResponse::PreconditionFailed().body(txt);
+        if let Err(response) = check_etag(resource, &request) {
+            return response;
         }
     }
 
