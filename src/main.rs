@@ -1,3 +1,4 @@
+#![deny(elided_lifetimes_in_paths)]
 use actix_web::web::Bytes;
 use actix_web::{App, web, HttpResponse, HttpRequest, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,7 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use sha256::digest;
+use std::time::{SystemTime, Duration};
 
 
 const TOKEN_LENGTH: usize = 32;
@@ -52,11 +54,17 @@ impl Etagged for Task {
     }
 }
 
+#[derive(PartialEq)]
+struct Token {
+    timestamp:  SystemTime,
+    value:      String,
+}
+
 // Application state
 struct State {
     journals:   RwLock<HashMap<usize, Journal>>,
     tasks:      RwLock<HashMap<usize, Task>>,
-    tokens:     Mutex<Vec<String>>
+    tokens:     Mutex<Vec<Token>>
 }
 
 trait Readable<T> {
@@ -68,33 +76,81 @@ impl Readable<Journal> for State {
         return &self.journals;
     }
 }
+
 impl Readable<Task> for State {
     fn get_hmap(&self) -> &RwLock<HashMap<usize, Task>> {
         return &self.tasks;
     }
 }
 
+const VALID_TIME_TOKEN: Duration = Duration::from_secs(60 * 3); 
+
 impl State {
     fn gen_token(&self) -> String {
-        let mut tokens = self.tokens.lock().unwrap();
+        let mut tokens  = self.tokens.lock().unwrap();
+
+        // cleaning older tokens...
+        let timestamp   =  SystemTime::now();
+
+        // 3 minutes for a token to become invalid
+        // removal of invalid entries
+        tokens.retain(|item| item.timestamp >= (timestamp - VALID_TIME_TOKEN));
+
         let rng = thread_rng();
-        let token: String = rng
+        let str_value: String = rng
             .sample_iter(&Alphanumeric)
             .take(TOKEN_LENGTH)
             .map(char::from)
             .collect();
-        tokens.push(token.clone());
-        token
+        let token = Token{
+            timestamp,
+            value: str_value.clone(),
+        };
+        tokens.push(token);
+        return str_value;
     }
 
     fn consume_token(&self, token: &str) -> bool {
         let mut tokens = self.tokens.lock().unwrap();
-        if let Some(index) = tokens.iter().position(|x| *x == token) {
-            tokens.remove(index);
-            true
+        if let Some(index) = tokens.iter().position(|x| *x.value == *token) {
+            let rmv = tokens.remove(index);
+            if rmv.timestamp < (SystemTime::now() - VALID_TIME_TOKEN) {
+                return false;
+            } else {
+                return true;
+            }
         } else {
             false
         }
+    }
+
+    fn rm_resource<T>(&self, id: &usize) -> Result<&str, &str> where State: Readable<T> {
+        let hmap: &RwLock<HashMap<usize, T>> = self.get_hmap();
+        let mut resources = hmap.write().unwrap();
+        if let Some(_) = resources.get(&id) {
+            resources.remove(&id);
+            return Ok("Removed");
+        } else {
+            return Err("Not found");
+        }
+    }
+
+    fn add_resource<T: Etagged + Serialize>(&self, 
+        mut resource: T, 
+        uri: String
+    ) -> Result<String, String> where State: Readable<T> {
+        let mut resources = self.get_hmap().write().unwrap();
+        let index = resources.len();
+        let uri = format!("{}/{}", uri, index);
+        let serialized_json = match serde_json::to_string(&resource) {
+            Ok(srlz)    => srlz,
+            Err(_)      => return Err(String::from("Error during serialization")),
+        };
+        let etag = calculate_hash(serialized_json);
+        resource.set_etag(etag.clone());
+        resources.insert(index, resource);
+        println!("Resource created {}, added at index: {}", uri, index);
+        return Ok(uri);
     }
 }
 
@@ -138,13 +194,16 @@ async fn get_by_id<T: Serialize + Etagged>(
     }
 }
 
-async fn post_resource<T: Etagged + Serialize>(
-    json: web::Json<T>, 
-    state: web::Data<State>, 
-    request: HttpRequest
-) -> impl Responder where State: Readable<T> {
+#[derive(Serialize, Deserialize)]
+struct TaskMerge {
+    ids: Vec<usize>
+}
 
-    let bad_request = |reason| HttpResponse::BadRequest().body(String::from(reason));
+fn response_token(
+    state: &web::Data<State>,
+    request: &HttpRequest
+) -> Result<(), HttpResponse> {
+    let bad_request = |reason| Err(HttpResponse::BadRequest().body(String::from(reason)));
     let token_val = match request.headers().get("Post-Token") {
         Some(token) => token,
         None        => return bad_request("Missing token"),
@@ -153,45 +212,80 @@ async fn post_resource<T: Etagged + Serialize>(
         Ok(str) => str,
         Err(_)  => return bad_request("Error during token retrieval"),
     };
-
     let is_allowed = state.consume_token(token);
-
     if !is_allowed {
         return bad_request("Bad token");
     }
+    return Ok(());
+}
 
-    let mut resources = state.get_hmap().write().unwrap();
-    let index = resources.len();
+async fn merge_tasks(
+    json: web::Json<TaskMerge>,
+    state: web::Data<State>,
+    request: HttpRequest
+) -> impl Responder where State: Readable<Task> {
+    if let Err(resp) = response_token(&state, &request) {
+        return resp;
+    }
+    let tasks = state.tasks.read().unwrap();
+    let info: TaskMerge = json.into_inner();
+    let (merged_text, all_done) = info.ids.iter()
+        .filter_map(|id| tasks.get(id))
+        .fold((String::new(), true), |(mut merged, all_true), item| {
+            merged.push('\n');
+            merged.push_str(&item.text);
+            (merged, all_true && item.done)
+        },
+    );
+    println!("Merged task data: {}", merged_text.clone());
 
-    let uri = format!("{}/{}", request.uri().path(), index);
-
-    let serialized_json = match serde_json::to_string(&json.0) {
-        Ok(srlz)    => srlz,
-        Err(_)      => return bad_request("json error"),
+    let new_task = Task {
+        text: merged_text,
+        done: all_done,
+        etag: String::from(""),
     };
-
-    let mut resource = json.into_inner();
-    let etag = calculate_hash(serialized_json);
-    resource.set_etag(etag.clone());
-    resources.insert(index, resource);
-    println!("Resource created {}, added at index: {}", request.path(), index);
+    let uri = String::from(request.uri().path());
+    drop(tasks);
+    let location = match state.add_resource(new_task, uri) {
+        Ok(res)  => res,
+        Err(res) => return HttpResponse::InternalServerError()
+            .body(res)
+    };
+    // else if it didn't fail, remove old entries
+    for id in info.ids {
+        state.rm_resource::<Task>(&id).unwrap();
+    };
     return HttpResponse::Created()
-        .append_header(("Location", uri)).body(String::from("OK"))
+            .append_header(("Location", location))
+            .body(String::from("OK"));
+}
+
+async fn post_resource<T: Etagged + Serialize>(
+    json: web::Json<T>, 
+    state: web::Data<State>, 
+    request: HttpRequest
+) -> impl Responder where State: Readable<T> {
+    if let Err(resp) = response_token(&state, &request) {
+        return resp;
+    }
+    let uri = String::from(request.uri().path());
+    let full_uri = match &state.add_resource(json.into_inner(), uri.clone()) {
+        Ok(index) => index.clone(),
+        Err(text) => return HttpResponse::InternalServerError().body(text.clone())
+    };
+    return HttpResponse::Created()
+        .append_header(("Location", full_uri)).body(String::from("OK"))
 }
 
 async fn delete_resource<T>(
     path: web::Path<usize>,
-    app_state: web::Data<State>,
+    state: web::Data<State>,
 ) -> impl Responder where State: Readable<T>, T: Serialize {
-    let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
-    let mut resources = hmap.write().unwrap();
     let id = path.into_inner();
-    if let Some(_) = resources.get(&id) {
-        resources.remove(&id);
-        HttpResponse::Ok().json("Removed")
-    } else {
-        HttpResponse::NotFound().body("Not found")
-    }
+    match &state.rm_resource(&id) {
+        Ok(msg)  => return HttpResponse::Ok().body(String::from(*msg)),
+        Err(msg) => return HttpResponse::NotFound().body(String::from(*msg))
+    };
 }
 
 fn calculate_hash(json_string: String) -> String {
@@ -357,7 +451,7 @@ async fn main() -> std::io::Result<()> {
     let app_state = web::Data::new(State {
         journals:   RwLock::new(journals),
         tasks:      RwLock::new(tasks),
-        tokens:     Mutex::new(Vec::<String>::new())
+        tokens:     Mutex::new(Vec::<Token>::new())
     });
 
     HttpServer::new(move || {
@@ -378,6 +472,10 @@ async fn main() -> std::io::Result<()> {
                 .route(web::delete().to(delete_resource::<Task>))
                 .route(web::put().to(put_resource::<Task>))
                 .route(web::patch().to(patch_task))
+            )
+            .service(
+                web::resource("/task_merger")
+                .route(web::post().to(merge_tasks))
             )
             .service(
                 web::resource("/journals")
