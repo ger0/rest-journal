@@ -1,4 +1,6 @@
 #![deny(elided_lifetimes_in_paths)]
+use std::io::BufReader;
+use std::io::Write;
 use actix_web::web::Bytes;
 use actix_web::{App, web, HttpResponse, HttpRequest, HttpServer, Responder};
 use serde::{Deserialize, Serialize};
@@ -9,16 +11,51 @@ use rand::{thread_rng, Rng};
 use std::collections::HashMap;
 use sha256::digest;
 use std::time::{SystemTime, Duration};
-
+use std::fs::File;
 
 const TOKEN_LENGTH: usize = 32;
+
+trait Jsonable<T> {
+    fn to_resource(&self) -> T;
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct JournalJSON {
+    title:      String,
+    data:       String
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct TaskJSON {
+    text:       String,
+    done:       bool 
+}
+
+impl Jsonable<Journal> for JournalJSON {
+    fn to_resource(&self) -> Journal {
+        return Journal{
+            title:  self.title.clone(),
+            data:   self.data.clone(),
+            etag:   String::from(""),
+        };
+    }
+}
+
+impl Jsonable<Task> for TaskJSON {
+    fn to_resource(&self) -> Task {
+        return Task{
+            text:   self.text.clone(),
+            done:   self.done.clone(),
+            etag:   String::from(""),
+        };
+    }
+}
 
 // journal entry
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Journal {
     title:      String,
     data:       String,
-    #[serde(skip_serializing, default)]
     etag:       String
 }
 
@@ -27,7 +64,6 @@ struct Journal {
 struct Task {
     text:       String,
     done:       bool,
-    #[serde(skip_serializing, default)]
     etag:       String
 }
 
@@ -54,7 +90,29 @@ impl Etagged for Task {
     }
 }
 
-#[derive(PartialEq)]
+trait ToJson<T> {
+    fn to_json(&self) -> T;
+}
+
+impl ToJson<JournalJSON> for Journal {
+    fn to_json(&self) -> JournalJSON {
+        return JournalJSON{
+            title:  self.title.clone(),
+            data:   self.data.clone()
+        }
+    }
+}
+
+impl ToJson<TaskJSON> for Task {
+    fn to_json(&self) -> TaskJSON {
+        return TaskJSON{
+            text:   self.text.clone(),
+            done:   self.done.clone()
+        }
+    }
+}
+
+#[derive(PartialEq, Serialize, Deserialize)]
 struct Token {
     timestamp:  SystemTime,
     value:      String,
@@ -124,7 +182,8 @@ impl State {
         }
     }
 
-    fn rm_resource<T>(&self, id: &usize) -> Result<&str, &str> where State: Readable<T> {
+    fn rm_resource<T>(&self, id: &usize) -> Result<&str, &str> 
+    where State: Readable<T> {
         let hmap: &RwLock<HashMap<usize, T>> = self.get_hmap();
         let mut resources = hmap.write().unwrap();
         if let Some(_) = resources.get(&id) {
@@ -175,11 +234,11 @@ async fn gen_token(state: web::Data<State>) -> impl Responder {
         .body(String::from(token))
 }
 
-async fn get_by_id<T: Serialize + Etagged>(
+async fn get_by_id<T: ToJson<Y>, Y: Serialize>(
     path: web::Path<usize>,
     state: web::Data<State>,
-) -> impl Responder where State: Readable<T>
-{
+) -> impl Responder 
+where T: Etagged, Y: Serialize, State: Readable<T> {
     let id = path.into_inner();
 
     let hmap: &RwLock<HashMap<usize, T>> = state.get_hmap();
@@ -188,9 +247,10 @@ async fn get_by_id<T: Serialize + Etagged>(
         let etag = resource.get_etag();
         return HttpResponse::Ok()
             .append_header(("ETag", etag))
-            .json(resource);
+            .json(resource.to_json());
     } else {
-        return HttpResponse::NotFound().body("Not found");
+        return HttpResponse::NotFound()
+            .body("Not found");
     }
 }
 
@@ -203,7 +263,8 @@ fn response_token(
     state: &web::Data<State>,
     request: &HttpRequest
 ) -> Result<(), HttpResponse> {
-    let bad_request = |reason| Err(HttpResponse::BadRequest().body(String::from(reason)));
+    let bad_request = |reason| Err(HttpResponse::BadRequest()
+        .body(String::from(reason)));
     let token_val = match request.headers().get("Post-Token") {
         Some(token) => token,
         None        => return bad_request("Missing token"),
@@ -260,21 +321,25 @@ async fn merge_tasks(
             .body(String::from("OK"));
 }
 
-async fn post_resource<T: Etagged + Serialize>(
-    json: web::Json<T>, 
+async fn post_resource<Resource, Json: Jsonable<Resource>>(
+    json: web::Json<Json>, 
     state: web::Data<State>, 
     request: HttpRequest
-) -> impl Responder where State: Readable<T> {
+) -> impl Responder 
+where Resource: Etagged + Serialize, State: Readable<Resource> {
     if let Err(resp) = response_token(&state, &request) {
         return resp;
     }
     let uri = String::from(request.uri().path());
-    let full_uri = match &state.add_resource(json.into_inner(), uri.clone()) {
+    let res = json.into_inner().to_resource();
+    let full_uri = match &state.add_resource(res, uri.clone()) {
         Ok(index) => index.clone(),
-        Err(text) => return HttpResponse::InternalServerError().body(text.clone())
+        Err(text) => return HttpResponse::InternalServerError()
+            .body(text.clone())
     };
     return HttpResponse::Created()
-        .append_header(("Location", full_uri)).body(String::from("OK"))
+        .append_header(("Location", full_uri))
+        .body(String::from("OK"))
 }
 
 async fn delete_resource<T>(
@@ -283,8 +348,10 @@ async fn delete_resource<T>(
 ) -> impl Responder where State: Readable<T>, T: Serialize {
     let id = path.into_inner();
     match &state.rm_resource(&id) {
-        Ok(msg)  => return HttpResponse::Ok().body(String::from(*msg)),
-        Err(msg) => return HttpResponse::NotFound().body(String::from(*msg))
+        Ok(msg)  => return HttpResponse::Ok()
+            .body(String::from(*msg)),
+        Err(msg) => return HttpResponse::NotFound()
+            .body(String::from(*msg))
     };
 }
 
@@ -298,14 +365,17 @@ fn check_etag<T: Etagged>(
     request: &HttpRequest) -> Result<(), HttpResponse> {
     let etag = match request.headers().get("If-Match") {
         Some(etag)  => etag,
-        None        => return Err(HttpResponse::PreconditionRequired().body("ETag is missing!")),
+        None        => return Err(HttpResponse::PreconditionRequired()
+            .body("ETag is missing!")),
     };
     let etag = match etag.to_str() {
         Ok(etag)    => etag,
-        Err(_)      => return Err(HttpResponse::BadRequest().body("Broken header!")),
+        Err(_)      => return Err(HttpResponse::BadRequest()
+            .body("Broken header!")),
     };
     if resource.get_etag() != etag {
-        return Err(HttpResponse::PreconditionFailed().body("ETag does not match!"));
+        return Err(HttpResponse::PreconditionFailed()
+            .body("ETag does not match!"));
     }
     return Ok(());
 }
@@ -316,7 +386,8 @@ async fn patch_task(
     path:       web::Path<usize>,
     request:    HttpRequest,
 ) -> impl Responder {
-    let bad_request = |reason| HttpResponse::BadRequest().body(String::from(reason));
+    let bad_request = |reason| HttpResponse::BadRequest()
+        .body(String::from(reason));
 
     let id = path.into_inner();
     let mut tasks = app_state.tasks.write().unwrap();
@@ -352,7 +423,8 @@ async fn patch_task(
     if is_updated {
         let serialized_json = match serde_json::to_string(&json) {
             Ok(srlz)    => srlz,
-            Err(_)      => return HttpResponse::BadRequest().body("Json error"),
+            Err(_)      => return HttpResponse::BadRequest()
+                .body("Json error"),
         };
         let new_etag = calculate_hash(serialized_json);
         task.set_etag(new_etag.clone());
@@ -364,15 +436,18 @@ async fn patch_task(
     }
 }
 
-async fn put_resource<T>(
-    json:       web::Json<T>,
+async fn put_resource<Resource, Json>(
+    json:       web::Json<Json>,
     app_state:  web::Data<State>,
     path:       web::Path<usize>,
     request:    HttpRequest
-) -> impl Responder where State: Readable<T>, T: Serialize + Etagged {
+) -> impl Responder 
+where State: Readable<Resource>, 
+    Resource: Etagged, 
+    Json: Serialize + Jsonable<Resource> {
     let id = path.into_inner();
 
-    let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
+    let hmap: &RwLock<HashMap<usize, Resource>> = app_state.get_hmap();
     let mut resources = hmap.write().unwrap();
 
     if let Some(resource) = resources.get(&id) {
@@ -384,10 +459,11 @@ async fn put_resource<T>(
     // else put the element in the HashMap of the resource
     let serialized_json = match serde_json::to_string(&json.0) {
         Ok(srlz)    => srlz,
-        Err(_)      => return HttpResponse::BadRequest().body("json error"),
+        Err(_)      => return HttpResponse::BadRequest()
+            .body("json error"),
     };
 
-    let mut new_resource = json.into_inner();
+    let mut new_resource = json.into_inner().to_resource();
     let new_etag = calculate_hash(serialized_json);
     new_resource.set_etag(new_etag.clone());
     resources.insert(id, new_resource);
@@ -397,12 +473,13 @@ async fn put_resource<T>(
         .body("Updated");
 }
 
-async fn get_resources<T>(
+async fn get_resources<Resource: ToJson<Json>, Json>(
     query: web::Query<PaginationParams>,
     app_state: web::Data<State>,
-) -> impl Responder where State: Readable<T>, T: Serialize {
+) -> impl Responder 
+where State: Readable<Resource>, Json: Serialize + Clone {
     // I'll end up in hell for this...
-    let hmap: &RwLock<HashMap<usize, T>> = app_state.get_hmap();
+    let hmap: &RwLock<HashMap<usize, Resource>> = app_state.get_hmap();
     let resources = hmap.read().unwrap();
 
     let page_num = query.page.unwrap_or(1);
@@ -414,9 +491,12 @@ async fn get_resources<T>(
     let start_index = (page_num - 1) * per_page;
 
     let ids: Vec<&usize> = resources.keys()
-        .into_iter().collect();
-    let item_slice: Vec<&T> = ids.into_iter().skip(start_index).take(per_page)
-        .map(|id| resources.get(id).unwrap())
+        .into_iter()
+        .collect();
+    let item_slice: Vec<Json> = ids.into_iter()
+        .skip(start_index)
+        .take(per_page)
+        .map(|id| resources.get(id).unwrap().to_json())
         .collect();
     
     let response = PaginationResponse {
@@ -429,31 +509,80 @@ async fn get_resources<T>(
     HttpResponse::Ok().json(response)
 }
 
+const JOURNAL_FILE: &str = "journals.bin";
+const TASK_FILE:    &str = "tasks.bin";
+const TOKEN_FILE:   &str = "tokens.bin";
+
+fn load_state() -> Result<web::Data<State>, ()> {
+    // Deserialize the data from the file
+    let file = match File::open(JOURNAL_FILE) {
+        Ok(f) => f,
+        Err(_) => return Err(()),
+    };
+    let reader = BufReader::new(file);
+    let journals: HashMap<usize, Journal> = bincode::deserialize_from(reader)
+        .expect("Deserialization failed");
+
+    let file = match File::open(TASK_FILE) {
+        Ok(f) => f,
+        Err(_) => return Err(()),
+    };
+    let reader = BufReader::new(file);
+    let tasks: HashMap<usize, Task> = bincode::deserialize_from(reader)
+        .expect("Deserialization failed");
+
+    let file = match File::open(TOKEN_FILE) {
+        Ok(f) => f,
+        Err(_) => return Err(()),
+    };
+    let reader = BufReader::new(file);
+    let tokens: Vec<Token> = bincode::deserialize_from(reader)
+        .expect("Deserialization failed");
+
+    let app_state = web::Data::new(State {
+        journals:   RwLock::new(journals),
+        tasks:      RwLock::new(tasks),
+        tokens:     Mutex::new(tokens)
+    });
+    println!("Old state recovered");
+    return Ok(app_state);
+}
+
+fn save_state(other: web::Data<State>) {
+    let mut file = File::create("tasks.bin").unwrap();
+    let tasks = other.tasks.read().unwrap();
+    let serialized = bincode::serialize(&tasks.clone()).unwrap();
+    file.write_all(&serialized).unwrap();
+
+    let mut file = File::create("journals.bin").unwrap();
+    // Serialize the structure into binary and write it to the file
+    let journals = other.journals.read().unwrap().clone();
+    let serialized = bincode::serialize(&journals).unwrap();
+    file.write_all(&serialized).unwrap();
+
+    let mut file = File::create("tokens.bin").unwrap();
+    let tokens = other.tokens.lock().unwrap();
+    let serialized = bincode::serialize(&*tokens).unwrap();
+    file.write_all(&serialized).unwrap();
+    println!("Saved state to files!");
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
-    let mut tasks: HashMap<usize, Task> = HashMap::new();
-    let mut journals: HashMap<usize, Journal> = HashMap::new();
-    for i in 0..10 {
-        journals.insert(i, Journal{
-            title: format!("Title {}", i),
-            data: String::from("Hello World!"),
-            etag: String::from("1")
-        });
-        tasks.insert(i, Task{
-            text: format!("Do the {}", i),
-            done: false,
-            etag: String::from("1")
-        });
-    }
-    let app_state = web::Data::new(State {
-        journals:   RwLock::new(journals),
-        tasks:      RwLock::new(tasks),
-        tokens:     Mutex::new(Vec::<Token>::new())
-    });
+    let app_state = match load_state() {
+        Ok(state) => state,
+        Err(_) =>
+            web::Data::new(State {
+                journals:   RwLock::new(HashMap::<usize, Journal>::new()),
+                tasks:      RwLock::new(HashMap::<usize, Task>::new()),
+                tokens:     Mutex::new(Vec::<Token>::new())
+        }),
+    };
+    let other = app_state.clone();
 
-    HttpServer::new(move || {
+    let res = HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
             .service(
@@ -462,14 +591,14 @@ async fn main() -> std::io::Result<()> {
             )
             .service(
                 web::resource("/tasks")
-                .route(web::get().to(get_resources::<Task>))
-                .route(web::post().to(post_resource::<Task>))
+                .route(web::get().to(get_resources::<Task, TaskJSON>))
+                .route(web::post().to(post_resource::<Task, TaskJSON>))
             )
             .service(
                 web::resource("/tasks/{id}")
-                .route(web::get().to(get_by_id::<Task>))
+                .route(web::get().to(get_by_id::<Task, TaskJSON>))
                 .route(web::delete().to(delete_resource::<Task>))
-                .route(web::put().to(put_resource::<Task>))
+                .route(web::put().to(put_resource::<Task, TaskJSON>))
                 .route(web::patch().to(patch_task))
             )
             .service(
@@ -478,17 +607,20 @@ async fn main() -> std::io::Result<()> {
             )
             .service(
                 web::resource("/journals")
-                .route(web::get().to(get_resources::<Journal>))
-                .route(web::post().to(post_resource::<Journal>))
+                .route(web::get().to(get_resources::<Journal, JournalJSON>))
+                .route(web::post().to(post_resource::<Journal, JournalJSON>))
             )
             .service(
                 web::resource("/journals/{id}")
-                .route(web::get().to(get_by_id::<Journal>))
+                .route(web::get().to(get_by_id::<Journal, JournalJSON>))
                 .route(web::delete().to(delete_resource::<Journal>))
-                .route(web::put().to(put_resource::<Journal>))
+                .route(web::put().to(put_resource::<Journal, JournalJSON>))
             )
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(("127.0.0.1", 8080))
+    .unwrap()
     .run()
-    .await
+    .await;
+    save_state(other);
+    return res;
 }
