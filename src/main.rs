@@ -412,12 +412,11 @@ async fn get_resources<T>(
     let total_pages = (total_entries + per_page - 1) / per_page;
 
     let start_index = (page_num - 1) * per_page;
-    let end_index = start_index + per_page;
 
-    let item_slice: Vec<&T> = resources
-        .iter()
-        .filter(|(&id, _)| id >= start_index && id <= end_index)
-        .map(|(_, entry)| entry)
+    let ids: Vec<&usize> = resources.keys()
+        .into_iter().collect();
+    let item_slice: Vec<&T> = ids.into_iter().skip(start_index).take(per_page)
+        .map(|id| resources.get(id).unwrap())
         .collect();
     
     let response = PaginationResponse {
